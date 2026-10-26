@@ -40,6 +40,10 @@ const (
 	receiveWatchdogInterval = 10 * time.Second
 	// defaultRegistrationTimeout bounds the wait for a new stream's registration header.
 	defaultRegistrationTimeout = 10 * time.Second
+	// defaultRegistrationProbeDelay is how long registration waits before its first self-probe.
+	defaultRegistrationProbeDelay = time.Second
+	// defaultRegistrationProbeInterval is the pause between self-probes while registering.
+	defaultRegistrationProbeInterval = 2 * time.Second
 )
 
 // errReceiveStreamStalled is reported when the receive stream is transport-alive
@@ -95,7 +99,9 @@ type GrpcClient struct {
 	receiveHandoffBlocked atomic.Bool
 	watchdogWg            sync.WaitGroup
 
-	registrationTimeout time.Duration
+	registrationTimeout       time.Duration
+	registrationProbeDelay    time.Duration
+	registrationProbeInterval time.Duration
 }
 
 // Option configures optional GrpcClient behavior.
@@ -118,6 +124,8 @@ func NewClient(ctx context.Context, addr string, key wgtypes.Key, tlsEnabled boo
 		connStateCallbackLock: sync.RWMutex{},
 		registrationTimeout:   defaultRegistrationTimeout,
 	}
+	c.registrationProbeDelay = defaultRegistrationProbeDelay
+	c.registrationProbeInterval = defaultRegistrationProbeInterval
 	for _, opt := range opts {
 		opt(c)
 	}
@@ -327,11 +335,40 @@ func (c *GrpcClient) connect(ctx context.Context, cancel context.CancelFunc, key
 	if err != nil {
 		return nil, err
 	}
-	if err := awaitRegistration(stream, c.registrationTimeout, cancel); err != nil {
+	stopProbe := startRegistrationProbe(ctx, c.registrationProbeDelay, c.registrationProbeInterval, c.sendReceiveProbe)
+	err = awaitRegistration(stream, c.registrationTimeout, cancel)
+	stopProbe()
+	if err != nil {
 		return nil, err
 	}
 
 	return stream, nil
+}
+
+// startRegistrationProbe self-probes until stopped; the echo gives header-holding proxies (AWS ALB) a DATA frame.
+func startRegistrationProbe(ctx context.Context, delay, interval time.Duration, send func(context.Context) error) (stop func()) {
+	probeCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		for {
+			select {
+			case <-probeCtx.Done():
+				return
+			case <-timer.C:
+			}
+			if err := send(probeCtx); err != nil {
+				log.Debugf("failed to send signal registration probe: %v", err)
+			}
+			timer.Reset(interval)
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
 }
 
 func awaitRegistration(stream proto.SignalExchange_ConnectStreamClient, timeout time.Duration, cancel context.CancelFunc) error {
